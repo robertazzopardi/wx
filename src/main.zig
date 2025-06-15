@@ -1,80 +1,152 @@
-//! By convention, main.zig is where your main function lives in the case that
-//! you are building an executable. If you are making a library, the convention
-//! is to delete this file and start with root.zig instead.
-
 const std = @import("std");
-
-/// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
 const lib = @import("wx_lib");
+const xev = @import("xev");
 
 const ChangeStore = std.StringHashMap(i128);
 const ArrayList = std.ArrayList([]const u8);
 
+const UserData = struct {
+    const Self = @This();
+
+    fs_changed: bool,
+    async_watcher: *const xev.Async,
+    command_manager: CommandManager,
+
+    fn init(
+        async_watcher: *const xev.Async,
+        command_manager: CommandManager,
+    ) Self {
+        return Self{
+            .fs_changed = false,
+            .async_watcher = async_watcher,
+            .command_manager = command_manager,
+        };
+    }
+};
+
+fn timerCallback(
+    ud: ?*UserData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = result catch unreachable;
+    std.debug.print("timer\n", .{});
+
+    if (ud) |data| {
+        data.async_watcher.notify() catch |err| {
+            std.debug.print("Failed to notify async: {}\n", .{err});
+        };
+    }
+
+    return .disarm;
+}
+
+fn asyncCallback(
+    ud: ?*UserData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    _ = result catch unreachable;
+    std.debug.print("async\n", .{});
+
+    if (ud) |data| {
+        data.command_manager.start() catch unreachable;
+    }
+
+    return .disarm;
+}
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-
     const allocator = arena.allocator();
 
-    // const stdout_file = std.io.getStdOut().writer();
-    // var bw = std.io.bufferedWriter(stdout_file);
-    // const stdout = bw.writer();
+    const cmd = try extractCommand(allocator);
+    const command = CommandManager.init(allocator, cmd);
 
-    // try stdout.print("Run `zig build test` to run the tests.\n", .{});
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
 
-    // try bw.flush(); // Don't forget to flush!
+    var comp: xev.Completion = undefined;
 
-    // Read system args
-    var command = ArrayList.init(allocator);
-    defer command.deinit();
-    var args = std.process.args();
-    _ = args.skip();
-    // while (args.next()) |arg| {
-    //     // std.debug.print("{s}\n", .{arg});
-    //     try command.append(arg);
-    // }
-    const str_cmd = args.next().?;
-    var str_split = std.mem.splitSequence(u8, str_cmd, " ");
-    while (str_split.next()) |part| {
-        try command.append(part);
-    }
+    var as = try xev.Async.init();
+    defer as.deinit();
 
-    // Command runner
-    const cmd: []const []const u8 = command.items;
-    try runCommand(allocator, cmd);
+    var data = UserData.init(&as, command);
+    as.wait(&loop, &comp, UserData, &data, asyncCallback);
+
+    var timer_comp: xev.Completion = undefined;
+    const watcher = try xev.Timer.init();
+    defer watcher.deinit();
+    watcher.run(&loop, &timer_comp, 1, UserData, &data, timerCallback);
+
+    try loop.run(.until_done);
+
+    // Run the command
+
+    // const cmd = try extractCommand(allocator);
+
+    // var command = CommandManager.init(allocator, cmd);
+    // try command.start();
 
     // Read the files
-    //
-    // var store = ChangeStore.init(allocator);
-    // defer store.deinit();
 
-    // const watch_dir = try std.fs.cwd().realpathAlloc(allocator, ".");
+    var store = ChangeStore.init(allocator);
+    defer store.deinit();
 
-    // var watch_iter = try std.fs.openDirAbsolute(
-    //     watch_dir,
-    //     .{ .iterate = true },
-    // );
-    // defer watch_iter.close();
+    const watch_dir = try std.fs.cwd().realpathAlloc(allocator, ".");
 
-    // var dir_walker: std.fs.Dir.Walker = undefined;
-    // defer dir_walker.deinit();
+    var watch_iter = try std.fs.openDirAbsolute(
+        watch_dir,
+        .{ .iterate = true },
+    );
+    defer watch_iter.close();
 
-    // var first_check = true;
+    var dir_walker: std.fs.Dir.Walker = undefined;
+    defer dir_walker.deinit();
 
-    // while (true) {
-    //     dir_walker = try watch_iter.walk(allocator);
+    var first_check = true;
 
-    //     const m = try getDirModifications(
-    //         allocator,
-    //         watch_iter,
-    //         &dir_walker,
-    //         &store,
-    //         &first_check,
-    //     );
-    //     std.debug.print("{}\n", .{m});
+    while (true) {
+        dir_walker = try watch_iter.walk(allocator);
 
-    //     std.time.sleep(1_000_000_000);
+        const files_changed = try getDirModifications(
+            allocator,
+            watch_iter,
+            &dir_walker,
+            &store,
+            &first_check,
+        );
+
+        if (files_changed) {}
+
+        std.time.sleep(1_000_000_000);
+    }
+}
+
+fn extractCommand(allocator: std.mem.Allocator) !Command {
+    var command = ArrayList.init(allocator);
+    defer command.deinit();
+
+    var args = std.process.args();
+    _ = args.skip(); // first arg is the this programs value
+
+    // process raw args
+    while (args.next()) |arg| {
+        // std.debug.print("{s}\n", .{arg});
+        try command.append(arg);
+    }
+
+    // process args as a string
+    // const str_cmd = args.next().?;
+    // var str_split = std.mem.splitSequence(u8, str_cmd, " ");
+    // while (str_split.next()) |part| {
+    //     try command.append(part);
     // }
+
+    return allocator.dupe([]const u8, command.items);
 }
 
 fn getDirModifications(
@@ -113,33 +185,55 @@ fn getDirModifications(
     return false;
 }
 
-fn runCommand(allocator: std.mem.Allocator, command: []const []const u8) !void {
-    std.log.info("{s}\n", .{command});
+// fn runCommand(allocator: std.mem.Allocator, command: Command) !void {
+//     std.log.info("{s}\n", .{command});
 
-    var child = std.process.Child.init(command, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+//     // Wait for completion
+//     const term = try child.wait();
 
-    try child.spawn();
+//     std.debug.print("Output: {s}\n", .{stderr});
+//     std.debug.print("Exit: {}\n", .{term});
+// }
 
-    // Stream stdout line by line
-    if (child.stdout) |stdout| {
-        var buf_reader = std.io.bufferedReader(stdout.reader());
-        var reader = buf_reader.reader();
+const Command = []const []const u8;
 
-        var line_buf: [1024]u8 = undefined;
-        while (try reader.readUntilDelimiterOrEof(line_buf[0..], '\n')) |line| {
-            std.debug.print("Output: {s}\n", .{line});
-        }
+const CommandManager = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    child: std.process.Child,
+
+    fn init(allocator: std.mem.Allocator, command: Command) Self {
+        var child = std.process.Child.init(command, allocator);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+
+        return Self{ .child = child, .allocator = allocator };
     }
 
-    // Get stderr
-    const stderr = try child.stderr.?.readToEndAlloc(allocator, 1024 * 1024);
-    // defer allocator.free(stderr);
+    fn start(self: *Self) !void {
+        try self.child.spawn();
 
-    // Wait for completion
-    const term = try child.wait();
+        try self.processOutput();
+    }
 
-    std.debug.print("Output: {s}\n", .{stderr});
-    std.debug.print("Exit: {}\n", .{term});
-}
+    fn stop(self: Self) !void {
+        try self.child.kill();
+    }
+
+    fn processOutput(self: Self) !void {
+        if (self.child.stdout) |stdout| {
+            var buf_reader = std.io.bufferedReader(stdout.reader());
+            var reader = buf_reader.reader();
+
+            var line_buf: [1024]u8 = undefined;
+            while (try reader.readUntilDelimiterOrEof(line_buf[0..], '\n')) |line| {
+                std.debug.print("{s}\n", .{line});
+            }
+        }
+
+        // Get stderr
+        const stderr = try self.child.stderr.?.readToEndAlloc(self.allocator, 1024 * 1024);
+        defer self.allocator.free(stderr);
+    }
+};
