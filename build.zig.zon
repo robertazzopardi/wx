@@ -65,10 +65,6 @@
         //    // actually used.
         //    .lazy = false,
         //},
-        .libxev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/main.tar.gz",
-            .hash = "libxev-0.0.0-86vtc87kEgBxgbJ1RI1R6Elynb7zydCgNR8dt3uw01My",
-        },
     },
 
     // Specifies the set of files and directories that are included in this package.
