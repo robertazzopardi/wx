@@ -50,38 +50,65 @@ const FileWatcher = struct {
         return gitignore;
     }
 
+    fn isIgnored(self: *Self, path: []const u8) !bool {
+        if (std.mem.startsWith(u8, path, try std.fs.path.join(self.allocator, &.{ ".", ".git/" }))) {
+            return true;
+        }
+
+        const path_to_check = if (std.mem.startsWith(u8, path, "/"))
+            path[1..]
+        else
+            path;
+
+        const result = try std.process.Child.run(.{
+            .argv = &.{ "git", "check-ignore", "-q", path_to_check },
+            .allocator = self.allocator,
+        });
+
+        return result.term.Exited == 0;
+    }
+
     fn scanFiles(self: *Self, dir_path: []const u8) !bool {
         var changes_detected = false;
 
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| {
-            switch (err) {
-                error.FileNotFound => return false,
-                else => return err,
-            }
-        };
+        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
         defer dir.close();
 
-        var walker = try dir.walk(self.allocator);
-        defer walker.deinit();
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            const full_path = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
+            defer self.allocator.free(full_path);
 
-        while (try walker.next()) |entry| {
-            if (entry.kind != .file) continue;
+            // Check if the path is ignored by git
+            if (try self.isIgnored(full_path)) {
+                continue;
+            }
 
-            // // Only watch .zig files
-            // if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+            switch (entry.kind) {
+                .directory => {
+                    // Recursively scan non-ignored directories
+                    if (try self.scanFiles(full_path)) {
+                        changes_detected = true;
+                    }
+                },
+                .file => {
+                    const stat = dir.statFile(entry.name) catch continue;
+                    const owned_path = try self.allocator.dupe(u8, full_path);
 
-            const stat = dir.statFile(entry.path) catch continue;
-            const owned_path = try self.allocator.dupe(u8, entry.path);
-
-            if (self.files.get(entry.path)) |prev_mtime| {
-                if (stat.mtime != prev_mtime) {
-                    std.debug.print("Changed: {s}\n", .{entry.path});
-                    try self.files.put(owned_path, stat.mtime);
-                    changes_detected = true;
-                }
-            } else {
-                try self.files.put(owned_path, stat.mtime);
-                // Don't count initial scan as changes
+                    if (self.files.get(full_path)) |prev_mtime| {
+                        if (stat.mtime != prev_mtime) {
+                            try self.files.put(owned_path, stat.mtime);
+                            changes_detected = true;
+                        } else {
+                            // Path already exists in our map with the same mtime
+                            self.allocator.free(owned_path);
+                        }
+                    } else {
+                        try self.files.put(owned_path, stat.mtime);
+                        // Don't count initial scan as changes
+                    }
+                },
+                else => {},
             }
         }
 
@@ -101,7 +128,7 @@ const FileWatcher = struct {
         try process.spawn();
         self.process = process;
 
-        std.debug.print("Started process: {s}\n", .{self.command});
+        std.log.info("Started process: {s}\n", .{self.command});
     }
 
     fn watch(self: *Self) !void {
@@ -111,19 +138,14 @@ const FileWatcher = struct {
         // Start the process initially
         try self.startProcess();
 
-        std.debug.print("Watching for changes...\n", .{});
-
         while (true) {
             std.time.sleep(500 * std.time.ns_per_ms); // 500ms poll interval
 
             if (try self.scanFiles(".")) {
-                std.debug.print("File changes detected, restarting...\n", .{});
                 try self.startProcess();
             }
 
             if (self.process) |*process| {
-                // std.debug.print("{any}\n", .{process.});
-
                 const pid = process.id;
                 const result = std.posix.waitpid(pid, 1);
                 if (result.status == 0) {
@@ -145,8 +167,8 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: {s} <command> [args...]\n", .{args[0]});
-        std.debug.print("Example: {s} zig build run\n", .{args[0]});
+        std.log.info("Usage: {s} <command> [args...]\n", .{args[0]});
+        std.log.info("Example: {s} zig build run\n", .{args[0]});
         return;
     }
 
