@@ -7,17 +7,21 @@ const FileWatcher = struct {
     files: std.HashMap([]const u8, i128, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     command: []const []const u8,
     process: ?std.process.Child,
+    gitignore: std.ArrayList([]const u8),
 
-    fn init(allocator: std.mem.Allocator, command: []const []const u8) Self {
+    fn init(allocator: std.mem.Allocator, command: []const []const u8) !Self {
         return Self{
             .allocator = allocator,
             .files = std.HashMap([]const u8, i128, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .command = command,
             .process = null,
+            .gitignore = try readGitIgnore(allocator),
         };
     }
 
     fn deinit(self: *Self) void {
+        self.gitignore.deinit();
+
         // Clean up file paths
         var iterator = self.files.iterator();
         while (iterator.next()) |entry| {
@@ -28,6 +32,22 @@ const FileWatcher = struct {
         if (self.process) |*process| {
             _ = process.kill() catch {};
         }
+    }
+
+    fn readGitIgnore(allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
+        const fileContents = try std.fs.cwd().readFileAlloc(allocator, ".gitignore", 4096);
+        defer allocator.free(fileContents);
+
+        var gitignore = std.ArrayList([]const u8).init(allocator);
+
+        var lines = std.mem.splitSequence(u8, fileContents, "\n");
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0 or trimmed[0] == '#') continue;
+            try gitignore.append(try allocator.dupe(u8, trimmed));
+        }
+
+        return gitignore;
     }
 
     fn scanFiles(self: *Self, dir_path: []const u8) !bool {
@@ -47,8 +67,8 @@ const FileWatcher = struct {
         while (try walker.next()) |entry| {
             if (entry.kind != .file) continue;
 
-            // Only watch .zig files
-            if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+            // // Only watch .zig files
+            // if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
 
             const stat = dir.statFile(entry.path) catch continue;
             const owned_path = try self.allocator.dupe(u8, entry.path);
@@ -100,14 +120,25 @@ const FileWatcher = struct {
                 std.debug.print("File changes detected, restarting...\n", .{});
                 try self.startProcess();
             }
+
+            if (self.process) |*process| {
+                // std.debug.print("{any}\n", .{process.});
+
+                const pid = process.id;
+                const result = std.posix.waitpid(pid, 1);
+                if (result.status == 0) {
+                    std.log.info("{s} exited with status: {x}\n", .{ self.command, result.status });
+                    break;
+                }
+            }
         }
     }
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     // Get command from args
     const args = try std.process.argsAlloc(allocator);
@@ -121,7 +152,7 @@ pub fn main() !void {
 
     const command = args[1..];
 
-    var watcher = FileWatcher.init(allocator, command);
+    var watcher = try FileWatcher.init(allocator, command);
     defer watcher.deinit();
 
     try watcher.watch();
