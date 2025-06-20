@@ -8,6 +8,8 @@ const FileWatcher = struct {
     command: []const []const u8,
     process: ?std.process.Child,
     gitignore: std.ArrayList([]const u8),
+    stdout_thread: ?std.Thread,
+    should_exit: std.atomic.Value(bool),
 
     fn init(allocator: std.mem.Allocator, command: []const []const u8) !Self {
         return Self{
@@ -16,10 +18,14 @@ const FileWatcher = struct {
             .command = command,
             .process = null,
             .gitignore = try readGitIgnore(allocator),
+            .stdout_thread = null,
+            .should_exit = std.atomic.Value(bool).init(false),
         };
     }
 
     fn deinit(self: *Self) void {
+        self.should_exit.store(true, .seq_cst);
+
         self.gitignore.deinit();
 
         // Clean up file paths
@@ -31,6 +37,34 @@ const FileWatcher = struct {
 
         if (self.process) |*process| {
             _ = process.kill() catch {};
+        }
+
+        // Wait for output thread to finish
+        if (self.stdout_thread) |thread| {
+            thread.join();
+        }
+
+        // Ensure we switch back to main screen
+        std.io.getStdOut().writer().writeAll("\x1b[?1049l") catch {};
+    }
+
+    // Thread function to handle stdout stream
+    fn outputHandler(self: *Self, stream: std.fs.File.Reader) void {
+        const stdout = std.io.getStdOut().writer();
+        var buf: [4096]u8 = undefined;
+
+        while (!self.should_exit.load(.seq_cst)) {
+            const bytes_read = stream.read(&buf) catch |err| {
+                if (err != error.WouldBlock) {
+                    break;
+                }
+                std.time.sleep(10 * std.time.ns_per_ms);
+                continue;
+            };
+
+            if (bytes_read == 0) break;
+
+            stdout.writeAll(buf[0..bytes_read]) catch {};
         }
     }
 
@@ -117,18 +151,36 @@ const FileWatcher = struct {
 
     fn startProcess(self: *Self) !void {
         if (self.process) |*process| {
+            self.should_exit.store(true, .seq_cst);
+
             _ = process.kill() catch {};
             _ = process.wait() catch {};
+
+            // Wait for output thread to finish
+            if (self.stdout_thread) |thread| {
+                thread.join();
+            }
+
+            self.stdout_thread = null;
         }
 
+        // Switch to alternate screen and clear it
+        try std.io.getStdOut().writer().writeAll("\x1b[?1049h\x1b");
+        try std.io.getStdOut().writer().writeAll("\x1b[2J\x1b[H");
+
+        // Reset exit flag
+        self.should_exit.store(false, .seq_cst);
+
         var process = std.process.Child.init(self.command, self.allocator);
-        process.stdout_behavior = .Inherit;
-        process.stderr_behavior = .Inherit;
+        // Set up pipe for stdout and discard stderr
+        process.stdout_behavior = .Pipe;
+        process.stderr_behavior = .Ignore;
 
         try process.spawn();
         self.process = process;
 
-        std.log.info("Started process: {s}\n", .{self.command});
+        // Create thread to handle stdout
+        self.stdout_thread = try std.Thread.spawn(.{}, outputHandler, .{ self, process.stdout.?.reader() });
     }
 
     fn watch(self: *Self) !void {
@@ -149,6 +201,8 @@ const FileWatcher = struct {
                 const pid = process.id;
                 const result = std.posix.waitpid(pid, 1);
                 if (result.status == 0) {
+                    // Switch back to main screen before exiting
+                    try std.io.getStdOut().writer().writeAll("\x1b[?1049l");
                     std.log.info("{s} exited with status: {x}\n", .{ self.command, result.status });
                     break;
                 }
@@ -158,7 +212,7 @@ const FileWatcher = struct {
 };
 
 pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
