@@ -1,145 +1,235 @@
-//! By convention, main.zig is where your main function lives in the case that
-//! you are building an executable. If you are making a library, the convention
-//! is to delete this file and start with root.zig instead.
-
 const std = @import("std");
 
-/// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
-const lib = @import("wx_lib");
+const FileWatcher = struct {
+    const Self = @This();
 
-const ChangeStore = std.StringHashMap(i128);
-const ArrayList = std.ArrayList([]const u8);
+    allocator: std.mem.Allocator,
+    files: std.HashMap([]const u8, i128, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
+    command: []const []const u8,
+    process: ?std.process.Child,
+    gitignore: std.ArrayList([]const u8),
+    stdout_thread: ?std.Thread,
+    should_exit: std.atomic.Value(bool),
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-
-    const allocator = arena.allocator();
-
-    // const stdout_file = std.io.getStdOut().writer();
-    // var bw = std.io.bufferedWriter(stdout_file);
-    // const stdout = bw.writer();
-
-    // try stdout.print("Run `zig build test` to run the tests.\n", .{});
-
-    // try bw.flush(); // Don't forget to flush!
-
-    // Read system args
-    var command = ArrayList.init(allocator);
-    defer command.deinit();
-    var args = std.process.args();
-    _ = args.skip();
-    // while (args.next()) |arg| {
-    //     // std.debug.print("{s}\n", .{arg});
-    //     try command.append(arg);
-    // }
-    const str_cmd = args.next().?;
-    var str_split = std.mem.splitSequence(u8, str_cmd, " ");
-    while (str_split.next()) |part| {
-        try command.append(part);
+    fn init(allocator: std.mem.Allocator, command: []const []const u8) !Self {
+        return Self{
+            .allocator = allocator,
+            .files = std.HashMap([]const u8, i128, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .command = command,
+            .process = null,
+            .gitignore = try readGitIgnore(allocator),
+            .stdout_thread = null,
+            .should_exit = std.atomic.Value(bool).init(false),
+        };
     }
 
-    // Command runner
-    const cmd: []const []const u8 = command.items;
-    try runCommand(allocator, cmd);
+    fn deinit(self: *Self) void {
+        self.should_exit.store(true, .seq_cst);
 
-    // Read the files
-    //
-    // var store = ChangeStore.init(allocator);
-    // defer store.deinit();
+        self.gitignore.deinit();
 
-    // const watch_dir = try std.fs.cwd().realpathAlloc(allocator, ".");
+        // Clean up file paths
+        var iterator = self.files.iterator();
+        while (iterator.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.files.deinit();
 
-    // var watch_iter = try std.fs.openDirAbsolute(
-    //     watch_dir,
-    //     .{ .iterate = true },
-    // );
-    // defer watch_iter.close();
-
-    // var dir_walker: std.fs.Dir.Walker = undefined;
-    // defer dir_walker.deinit();
-
-    // var first_check = true;
-
-    // while (true) {
-    //     dir_walker = try watch_iter.walk(allocator);
-
-    //     const m = try getDirModifications(
-    //         allocator,
-    //         watch_iter,
-    //         &dir_walker,
-    //         &store,
-    //         &first_check,
-    //     );
-    //     std.debug.print("{}\n", .{m});
-
-    //     std.time.sleep(1_000_000_000);
-    // }
-}
-
-fn getDirModifications(
-    allocator: std.mem.Allocator,
-    watch_dir: std.fs.Dir,
-    dir_walker: *std.fs.Dir.Walker,
-    store: *ChangeStore,
-    first_check: *bool,
-) !bool {
-    while (try dir_walker.next()) |entry| {
-        if (entry.kind != .file) {
-            continue;
+        if (self.process) |*process| {
+            _ = process.kill() catch {};
         }
 
-        const file_stat = try watch_dir.statFile(entry.path);
+        // Wait for output thread to finish
+        if (self.stdout_thread) |thread| {
+            thread.join();
+        }
 
-        if (store.get(entry.path)) |prev_file_stat| {
-            if (file_stat.mtime != prev_file_stat) {
-                try store.put(entry.path, file_stat.mtime);
-                return true;
-            }
-        } else {
-            const copy_path = try allocator.dupe(u8, entry.path);
-            try store.put(copy_path, file_stat.mtime);
+        // Ensure we switch back to main screen
+        std.io.getStdOut().writer().writeAll("\x1b[?1049l") catch {};
+    }
 
-            if (first_check.* == true) {
+    // Thread function to handle stdout stream
+    fn outputHandler(self: *Self, stream: std.fs.File.Reader) void {
+        const stdout = std.io.getStdOut().writer();
+        var buf: [4096]u8 = undefined;
+
+        while (!self.should_exit.load(.seq_cst)) {
+            const bytes_read = stream.read(&buf) catch |err| {
+                if (err != error.WouldBlock) {
+                    break;
+                }
+                std.time.sleep(10 * std.time.ns_per_ms);
+                continue;
+            };
+
+            if (bytes_read == 0) break;
+
+            stdout.writeAll(buf[0..bytes_read]) catch {};
+        }
+    }
+
+    fn readGitIgnore(allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
+        const fileContents = try std.fs.cwd().readFileAlloc(allocator, ".gitignore", 4096);
+        defer allocator.free(fileContents);
+
+        var gitignore = std.ArrayList([]const u8).init(allocator);
+
+        var lines = std.mem.splitSequence(u8, fileContents, "\n");
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0 or trimmed[0] == '#') continue;
+            try gitignore.append(try allocator.dupe(u8, trimmed));
+        }
+
+        return gitignore;
+    }
+
+    fn isIgnored(self: *Self, path: []const u8) !bool {
+        if (std.mem.startsWith(u8, path, try std.fs.path.join(self.allocator, &.{ ".", ".git/" }))) {
+            return true;
+        }
+
+        const path_to_check = if (std.mem.startsWith(u8, path, "/"))
+            path[1..]
+        else
+            path;
+
+        const result = try std.process.Child.run(.{
+            .argv = &.{ "git", "check-ignore", "-q", path_to_check },
+            .allocator = self.allocator,
+        });
+
+        return result.term.Exited == 0;
+    }
+
+    fn scanFiles(self: *Self, dir_path: []const u8) !bool {
+        var changes_detected = false;
+
+        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            const full_path = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
+            defer self.allocator.free(full_path);
+
+            // Check if the path is ignored by git
+            if (try self.isIgnored(full_path)) {
                 continue;
             }
 
-            return true;
+            switch (entry.kind) {
+                .directory => {
+                    // Recursively scan non-ignored directories
+                    if (try self.scanFiles(full_path)) {
+                        changes_detected = true;
+                    }
+                },
+                .file => {
+                    const stat = dir.statFile(entry.name) catch continue;
+                    const owned_path = try self.allocator.dupe(u8, full_path);
+
+                    if (self.files.get(full_path)) |prev_mtime| {
+                        if (stat.mtime != prev_mtime) {
+                            try self.files.put(owned_path, stat.mtime);
+                            changes_detected = true;
+                        } else {
+                            // Path already exists in our map with the same mtime
+                            self.allocator.free(owned_path);
+                        }
+                    } else {
+                        try self.files.put(owned_path, stat.mtime);
+                        // Don't count initial scan as changes
+                    }
+                },
+                else => {},
+            }
         }
+
+        return changes_detected;
     }
 
-    first_check.* = false;
+    fn startProcess(self: *Self) !void {
+        if (self.process) |*process| {
+            self.should_exit.store(true, .seq_cst);
 
-    return false;
-}
+            _ = process.kill() catch {};
+            _ = process.wait() catch {};
 
-fn runCommand(allocator: std.mem.Allocator, command: []const []const u8) !void {
-    std.log.info("{s}\n", .{command});
+            // Wait for output thread to finish
+            if (self.stdout_thread) |thread| {
+                thread.join();
+            }
 
-    var child = std.process.Child.init(command, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    // Stream stdout line by line
-    if (child.stdout) |stdout| {
-        var buf_reader = std.io.bufferedReader(stdout.reader());
-        var reader = buf_reader.reader();
-
-        var line_buf: [1024]u8 = undefined;
-        while (try reader.readUntilDelimiterOrEof(line_buf[0..], '\n')) |line| {
-            std.debug.print("Output: {s}\n", .{line});
+            self.stdout_thread = null;
         }
+
+        // Switch to alternate screen and clear it
+        try std.io.getStdOut().writer().writeAll("\x1b[?1049h\x1b");
+        try std.io.getStdOut().writer().writeAll("\x1b[2J\x1b[H");
+
+        // Reset exit flag
+        self.should_exit.store(false, .seq_cst);
+
+        var process = std.process.Child.init(self.command, self.allocator);
+        // Set up pipe for stdout and discard stderr
+        process.stdout_behavior = .Pipe;
+        process.stderr_behavior = .Ignore;
+
+        try process.spawn();
+        self.process = process;
+
+        // Create thread to handle stdout
+        self.stdout_thread = try std.Thread.spawn(.{}, outputHandler, .{ self, process.stdout.?.reader() });
     }
 
-    // Get stderr
-    const stderr = try child.stderr.?.readToEndAlloc(allocator, 1024 * 1024);
-    // defer allocator.free(stderr);
+    fn watch(self: *Self) !void {
+        // Initial scan
+        _ = try self.scanFiles(".");
 
-    // Wait for completion
-    const term = try child.wait();
+        // Start the process initially
+        try self.startProcess();
 
-    std.debug.print("Output: {s}\n", .{stderr});
-    std.debug.print("Exit: {}\n", .{term});
+        while (true) {
+            std.time.sleep(500 * std.time.ns_per_ms); // 500ms poll interval
+
+            if (try self.scanFiles(".")) {
+                try self.startProcess();
+            }
+
+            if (self.process) |*process| {
+                const pid = process.id;
+                const result = std.posix.waitpid(pid, 1);
+                if (result.status == 0) {
+                    // Switch back to main screen before exiting
+                    try std.io.getStdOut().writer().writeAll("\x1b[?1049l");
+                    std.log.info("{s} exited with status: {x}\n", .{ self.command, result.status });
+                    break;
+                }
+            }
+        }
+    }
+};
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Get command from args
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (args.len < 2) {
+        std.log.info("Usage: {s} <command> [args...]\n", .{args[0]});
+        std.log.info("Example: {s} zig build run\n", .{args[0]});
+        return;
+    }
+
+    const command = args[1..];
+
+    var watcher = try FileWatcher.init(allocator, command);
+    defer watcher.deinit();
+
+    try watcher.watch();
 }
