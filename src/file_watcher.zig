@@ -1,4 +1,39 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const ProcessState = enum {
+    const Self = @This();
+
+    running,
+    erroring,
+    exited,
+
+    inline fn handleProcessBehavior(self: Self) bool {
+        return switch (self) {
+            .running => true,
+            .erroring => true,
+            .exited => false,
+        };
+    }
+};
+
+/// Custom wrapper for waitpid that properly handles errors instead of using unreachable
+fn safeWaitpid(pid: std.posix.pid_t, flags: u32) !std.posix.WaitPidResult {
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        const rc = std.posix.system.waitpid(pid, &status, @intCast(flags));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return .{
+                .pid = @intCast(rc),
+                .status = @bitCast(status),
+            },
+            .INTR => continue,
+            .CHILD => return error.ProcessNotFound, // Process doesn't exist
+            .INVAL => return error.InvalidArgument, // Invalid flags
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
 
 pub const FileWatcher = struct {
     const Self = @This();
@@ -7,6 +42,7 @@ pub const FileWatcher = struct {
     files: std.HashMap([]const u8, i128, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     command: []const []const u8,
     process: ?std.process.Child,
+    process_state: ProcessState,
     gitignore: std.ArrayList([]const u8),
     stdout_thread: ?std.Thread,
     stderr_thread: ?std.Thread,
@@ -18,6 +54,7 @@ pub const FileWatcher = struct {
             .files = std.HashMap([]const u8, i128, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .command = command,
             .process = null,
+            .process_state = .exited,
             .gitignore = try readGitIgnore(allocator),
             .stdout_thread = null,
             .stderr_thread = null,
@@ -194,16 +231,10 @@ pub const FileWatcher = struct {
         if (self.process) |*process| {
             self.should_exit.store(true, .seq_cst);
 
-            _ = process.kill() catch |err| {
-                std.log.err("Failed to kill previous process: {s}", .{@errorName(err)});
-                // Continue anyway
-            };
+            _ = try process.kill();
 
             // Wait for process to terminate
-            _ = process.wait() catch |err| {
-                std.log.err("Error waiting for process to terminate: {s}", .{@errorName(err)});
-                // Continue anyway
-            };
+            _ = try process.wait();
 
             // Wait for output threads to finish
             if (self.stdout_thread) |thread| {
@@ -217,6 +248,7 @@ pub const FileWatcher = struct {
             self.stdout_thread = null;
             self.stderr_thread = null;
             self.process = null;
+            self.process_state = .exited;
         }
 
         // Switch to alternate screen and clear it
@@ -233,6 +265,7 @@ pub const FileWatcher = struct {
 
         try process.spawn();
         self.process = process;
+        self.process_state = .running;
 
         // Create thread to handle stdout
         self.stdout_thread = try std.Thread.spawn(
@@ -249,58 +282,98 @@ pub const FileWatcher = struct {
         );
     }
 
+    fn handleProcessState(self: *Self) !bool {
+        if (self.process) |*process| {
+            const pid = process.id;
+            const result = safeWaitpid(pid, 1) catch |err| {
+                switch (err) {
+                    error.ProcessNotFound => {
+                        // Process no longer exists
+                        self.process = null;
+                        self.process_state = .exited;
+                        return true; // Continue watching for file changes
+                    },
+                    error.InvalidArgument => {
+                        std.log.err("Invalid argument to waitpid", .{});
+                        self.process = null;
+                        self.process_state = .erroring;
+                        return true; // Continue watching
+                    },
+                    else => {
+                        std.log.err("Unexpected error in waitpid: {s}", .{@errorName(err)});
+                        self.process = null;
+                        self.process_state = .erroring;
+                        return true; // Continue watching
+                    },
+                }
+            };
+
+            if (result.pid != 0) {
+                // Process has exited
+                if (std.posix.W.IFEXITED(result.status)) {
+                    const exit_code = std.posix.W.EXITSTATUS(result.status);
+                    if (exit_code != 0) {
+                        self.process_state = .erroring;
+                        std.log.err("{s} exited with error code: {d}", .{ self.command[0], exit_code });
+                        return self.process_state.handleProcessBehavior();
+                    } else {
+                        self.process_state = .exited;
+                        // Switch back to main screen before exiting
+                        try std.io.getStdOut().writer().writeAll("\x1b[?1049l");
+                        std.log.info("{s} completed successfully", .{self.command[0]});
+                        return false; // Signal to exit the watch loop
+                    }
+                } else if (std.posix.W.IFSIGNALED(result.status)) {
+                    // Process was terminated by a signal
+                    self.process_state = .erroring;
+                    const signal = std.posix.W.TERMSIG(result.status);
+                    std.log.err("{s} terminated by signal: {d}", .{ self.command[0], signal });
+                    return self.process_state.handleProcessBehavior();
+                }
+
+                // Clear the process reference since it's no longer running
+                self.process = null;
+            } else {
+                // Process is still running
+                self.process_state = .running;
+            }
+        } else {
+            self.process_state = .exited;
+        }
+
+        return true; // Continue watching
+    }
+
     pub fn watch(self: *Self) !void {
         // Initial scan
         _ = try self.scanFiles(".");
 
         // Start the process initially
         self.startProcess() catch |err| {
-            std.log.err("Failed to start process: {s}, error: {s}", .{self.command[0], @errorName(err)});
+            self.process_state = .erroring;
+            std.log.err("Failed to start process: {s}, error: {s}", .{ self.command[0], @errorName(err) });
         };
 
         while (true) {
             std.time.sleep(500 * std.time.ns_per_ms); // 500ms poll interval
 
             const changes_detected = try self.scanFiles(".");
-            
+
             // Check if we need to restart the process
             const should_restart = changes_detected or (self.process == null);
-            
+
             if (should_restart) {
                 std.log.info("File changes detected or process not running, restarting process...", .{});
                 self.startProcess() catch |err| {
-                    std.log.err("Failed to restart process: {s}, error: {s}", .{self.command[0], @errorName(err)});
+                    self.process_state = .erroring;
+                    std.log.err("Failed to restart process: {s}, error: {s}", .{ self.command[0], @errorName(err) });
                 };
             }
 
-            if (self.process) |*process| {
-                const pid = process.id;
-                const result = std.posix.waitpid(pid, 1);
-                // WNOHANG (1) means don't block, if process is still running, result.status will be 0
-                if (result.pid != 0) {
-                    // Process has exited
-                    if (std.posix.W.IFEXITED(result.status)) {
-                        const exit_code = std.posix.W.EXITSTATUS(result.status);
-                        if (exit_code != 0) {
-                            std.log.err("{s} exited with error code: {d}", .{ self.command[0], exit_code });
-                            // Don't exit the watcher, wait for file changes to restart
-                        } else {
-                            // Normal exit with status 0
-                            // Switch back to main screen before exiting
-                            try std.io.getStdOut().writer().writeAll("\x1b[?1049l");
-                            std.log.info("{s} completed successfully", .{self.command[0]});
-                            break;
-                        }
-                    } else if (std.posix.W.IFSIGNALED(result.status)) {
-                        // Process was terminated by a signal
-                        const signal = std.posix.W.TERMSIG(result.status);
-                        std.log.err("{s} terminated by signal: {d}", .{ self.command[0], signal });
-                        // Don't exit the watcher, wait for file changes to restart
-                    }
-                    
-                    // Clear the process reference since it's no longer running
-                    self.process = null;
-                }
+            // Handle the current process state and decide whether to continue
+            const should_continue = try self.handleProcessState();
+            if (!should_continue) {
+                break;
             }
         }
     }
