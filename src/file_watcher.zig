@@ -271,6 +271,7 @@ pub const FileWatcher = struct {
                 std.log.err("{s} exited with code {d}", .{ self.command[0], code });
             } else {
                 std.log.info("{s} exited successfully", .{self.command[0]});
+                g_shutdown.store(true, .seq_cst);
             }
         } else if (std.posix.W.IFSIGNALED(result.status)) {
             const sig = std.posix.W.TERMSIG(result.status);
@@ -306,10 +307,7 @@ pub const FileWatcher = struct {
             const changes_detected = try self.scanFiles(".");
             if (changes_detected) pending_restart = true;
 
-            // Only restart when the process is not running. This prevents the flicker
-            // loop caused by build tools (cargo, zig, etc.) writing artifacts while
-            // compiling — those file changes are noticed but held until the build exits.
-            if (pending_restart and !self.process_running) {
+            if (pending_restart) {
                 pending_restart = false;
                 std.log.info("Changes detected, restarting...", .{});
                 self.startProcess() catch |err| {
