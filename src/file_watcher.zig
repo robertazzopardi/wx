@@ -1,25 +1,39 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const ProcessState = enum(i32) {
-    const Self = @This();
+// Global state for signal handlers (must be file-scope, not inside struct)
+var g_child_pid: std.atomic.Value(std.posix.pid_t) = .init(0);
+var g_shutdown: std.atomic.Value(bool) = .init(false);
 
-    running,
-    erroring,
-    exited,
-    not_started,
+fn handleSigint(sig: i32) callconv(.c) void {
+    _ = sig;
+    g_shutdown.store(true, .seq_cst);
+}
 
-    inline fn handleProcessBehavior(self: Self) bool {
-        return switch (self) {
-            .running => true,
-            .erroring => true,
-            .exited => false,
-            .not_started => true,
-        };
-    }
-};
+fn handleSigwinch(sig: i32) callconv(.c) void {
+    _ = sig;
+    const pid = g_child_pid.load(.seq_cst);
+    if (pid > 0) _ = std.c.kill(pid, std.posix.SIG.WINCH);
+}
 
-/// Custom wrapper for waitpid that properly handles errors instead of using unreachable
+fn setupSignals() void {
+    const sa_int = std.posix.Sigaction{
+        .handler = .{ .handler = handleSigint },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &sa_int, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &sa_int, null);
+
+    const sa_winch = std.posix.Sigaction{
+        .handler = .{ .handler = handleSigwinch },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.WINCH, &sa_winch, null);
+}
+
+/// Custom wrapper for waitpid that properly handles EINTR
 fn safeWaitpid(pid: std.posix.pid_t, flags: u32) !std.posix.WaitPidResult {
     var status: if (builtin.link_libc) c_int else u32 = undefined;
     while (true) {
@@ -30,11 +44,19 @@ fn safeWaitpid(pid: std.posix.pid_t, flags: u32) !std.posix.WaitPidResult {
                 .status = @bitCast(status),
             },
             .INTR => continue,
-            .CHILD => return error.ProcessNotFound, // Process doesn't exist
-            .INVAL => return error.InvalidArgument, // Invalid flags
+            .CHILD => return error.ProcessNotFound,
+            .INVAL => return error.InvalidArgument,
             else => |err| return std.posix.unexpectedErrno(err),
         }
     }
+}
+
+fn enterAlternateScreen() void {
+    std.io.getStdOut().writer().writeAll("\x1b[?1049h\x1b[2J\x1b[H") catch {};
+}
+
+fn leaveAlternateScreen() void {
+    std.io.getStdOut().writer().writeAll("\x1b[?1049l") catch {};
 }
 
 pub const FileWatcher = struct {
@@ -44,10 +66,8 @@ pub const FileWatcher = struct {
     files: std.HashMap([]const u8, i128, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     command: []const []const u8,
     process: ?std.process.Child,
-    process_state: std.atomic.Value(ProcessState),
+    process_running: bool,
     gitignore: std.ArrayList([]const u8),
-    stdout_thread: ?std.Thread,
-    stderr_thread: ?std.Thread,
 
     pub fn init(allocator: std.mem.Allocator, command: []const []const u8) !Self {
         return Self{
@@ -55,117 +75,36 @@ pub const FileWatcher = struct {
             .files = std.HashMap([]const u8, i128, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .command = command,
             .process = null,
-            .process_state = std.atomic.Value(ProcessState).init(.not_started),
-            .gitignore = try readGitIgnore(allocator),
-            .stdout_thread = null,
-            .stderr_thread = null,
+            .process_running = false,
+            .gitignore = readGitIgnore(allocator) catch std.ArrayList([]const u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // Signal threads to exit by changing process state
-        self.process_state.store(.exited, .seq_cst);
+        if (self.process) |*process| {
+            _ = process.kill() catch {};
+            _ = process.wait() catch {};
+            g_child_pid.store(0, .seq_cst);
+        }
 
         self.gitignore.deinit();
 
-        // Clean up file paths
         var iterator = self.files.iterator();
         while (iterator.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
         }
         self.files.deinit();
 
-        if (self.process) |*process| {
-            _ = process.kill() catch {};
-        }
-
-        // Wait for output threads to finish
-        if (self.stdout_thread) |thread| {
-            thread.join();
-        }
-
-        if (self.stderr_thread) |thread| {
-            thread.join();
-        }
-
-        // Ensure we switch back to main screen
-        std.io.getStdOut().writer().writeAll("\x1b[?1049l") catch {};
-    }
-
-    // Thread function to handle stdout stream
-    fn outputHandler(self: *Self, stream: std.fs.File.Reader) void {
-        const stdout = std.io.getStdOut().writer();
-        var buf: [4096]u8 = undefined;
-
-        while (true) {
-            if (self.process_state.load(.seq_cst) != .running) {
-                break;
-            }
-
-            const bytes_read = stream.read(&buf) catch |err| {
-                if (err == error.WouldBlock) {
-                    std.time.sleep(10 * std.time.ns_per_ms);
-                    continue;
-                }
-
-                // Log other errors but don't crash
-                std.log.err("Error reading from process output: {s}", .{@errorName(err)});
-                break;
-            };
-
-            if (bytes_read == 0) break;
-
-            stdout.writeAll(buf[0..bytes_read]) catch |err| {
-                std.log.err("Error writing to stdout: {s}", .{@errorName(err)});
-                break;
-            };
-        }
-
-        // clear the screen
-        stdout.writeAll("\x1b[2J\x1b[H") catch {};
-    }
-
-    // Thread function to handle stderr stream
-    fn errorHandler(self: *Self, stream: std.fs.File.Reader) void {
-        const stdout = std.io.getStdErr().writer();
-        var buf: [4096]u8 = undefined;
-
-        while (self.process_state.load(.seq_cst) == .erroring) {
-            std.debug.print("outputHandler {s}\n", .{@tagName(self.process_state.load(.seq_cst))});
-
-            const bytes_read = stream.read(&buf) catch |err| {
-                if (err == error.WouldBlock) {
-                    std.time.sleep(10 * std.time.ns_per_ms);
-                    continue;
-                }
-
-                // Log other errors but don't crash
-                std.log.err("Error reading from process error stream: {s}", .{@errorName(err)});
-                break;
-            };
-
-            if (bytes_read == 0) break;
-
-            // Write to stderr with a distinctive color
-            // stdout.writeAll("\x1b[31m") catch {}; // Red text
-            stdout.writeAll(buf[0..bytes_read]) catch |err| {
-                std.log.err("Error writing to stderr: {s}", .{@errorName(err)});
-                break;
-            };
-            // stdout.writeAll("\x1b[0m") catch {}; // Reset color
-        }
-
-        // clear the screen
-        stdout.writeAll("\x1b[2J\x1b[H") catch {};
+        leaveAlternateScreen();
     }
 
     fn readGitIgnore(allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
-        const fileContents = try std.fs.cwd().readFileAlloc(allocator, ".gitignore", 4096);
-        defer allocator.free(fileContents);
+        const file_contents = try std.fs.cwd().readFileAlloc(allocator, ".gitignore", 65536);
+        defer allocator.free(file_contents);
 
         var gitignore = std.ArrayList([]const u8).init(allocator);
 
-        var lines = std.mem.splitSequence(u8, fileContents, "\n");
+        var lines = std.mem.splitSequence(u8, file_contents, "\n");
         while (lines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0 or trimmed[0] == '#') continue;
@@ -175,22 +114,25 @@ pub const FileWatcher = struct {
         return gitignore;
     }
 
-    fn isIgnored(self: *Self, path: []const u8) !bool {
-        if (std.mem.startsWith(u8, path, try std.fs.path.join(self.allocator, &.{ ".", ".git/" }))) {
-            return true;
+    fn matchesPattern(pattern: []const u8, name: []const u8, full_path: []const u8) bool {
+        // Directory pattern: "node_modules/" matches directory by name
+        if (std.mem.endsWith(u8, pattern, "/")) {
+            return std.mem.eql(u8, name, pattern[0 .. pattern.len - 1]);
         }
+        // Wildcard extension: "*.o" or "*.zig-cache"
+        if (std.mem.startsWith(u8, pattern, "*.")) {
+            return std.mem.endsWith(u8, name, pattern[1..]);
+        }
+        // Exact name match or full path match
+        return std.mem.eql(u8, name, pattern) or std.mem.eql(u8, full_path, pattern);
+    }
 
-        const path_to_check = if (std.mem.startsWith(u8, path, "/"))
-            path[1..]
-        else
-            path;
-
-        const result = try std.process.Child.run(.{
-            .argv = &.{ "git", "check-ignore", "-q", path_to_check },
-            .allocator = self.allocator,
-        });
-
-        return result.term.Exited == 0;
+    fn isIgnored(self: *Self, name: []const u8, full_path: []const u8) bool {
+        if (std.mem.eql(u8, name, ".git")) return true;
+        for (self.gitignore.items) |pattern| {
+            if (matchesPattern(pattern, name, full_path)) return true;
+        }
+        return false;
     }
 
     fn scanFiles(self: *Self, dir_path: []const u8) !bool {
@@ -204,14 +146,10 @@ pub const FileWatcher = struct {
             const full_path = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
             defer self.allocator.free(full_path);
 
-            // Check if the path is ignored by git
-            if (try self.isIgnored(full_path)) {
-                continue;
-            }
+            if (self.isIgnored(entry.name, full_path)) continue;
 
             switch (entry.kind) {
                 .directory => {
-                    // Recursively scan non-ignored directories
                     if (try self.scanFiles(full_path)) {
                         changes_detected = true;
                     }
@@ -225,7 +163,6 @@ pub const FileWatcher = struct {
                             try self.files.put(owned_path, stat.mtime);
                             changes_detected = true;
                         } else {
-                            // Path already exists in our map with the same mtime
                             self.allocator.free(owned_path);
                         }
                     } else {
@@ -241,153 +178,116 @@ pub const FileWatcher = struct {
     }
 
     fn startProcess(self: *Self) !void {
-        // Signal threads to exit by changing process state
-        self.process_state.store(.not_started, .seq_cst);
-
+        // Kill existing process if running
         if (self.process) |*process| {
-            _ = try process.kill();
-
-            // Wait for process to terminate
-            _ = try process.wait();
-
-            // Wait for output threads to finish
-            if (self.stdout_thread) |thread| {
-                thread.join();
-            }
-
-            if (self.stderr_thread) |thread| {
-                thread.join();
-            }
-
-            self.stdout_thread = null;
-            self.stderr_thread = null;
+            _ = process.kill() catch {};
+            _ = process.wait() catch {};
             self.process = null;
+            self.process_running = false;
+            g_child_pid.store(0, .seq_cst);
         }
 
-        // Switch to alternate screen and clear it
-        try std.io.getStdOut().writer().writeAll("\x1b[?1049h\x1b");
-        try std.io.getStdOut().writer().writeAll("\x1b[2J\x1b[H");
-
-        // Set state to running before spawning threads
-        self.process_state.store(.running, .seq_cst);
+        enterAlternateScreen();
 
         var process = std.process.Child.init(self.command, self.allocator);
-        // Set up pipe for stdout and stderr
-        process.stdout_behavior = .Pipe;
-        process.stderr_behavior = .Pipe; // Capture stderr too
+        // Inherit all stdio so TUI apps get a real TTY
+        process.stdin_behavior = .Inherit;
+        process.stdout_behavior = .Inherit;
+        process.stderr_behavior = .Inherit;
 
         try process.spawn();
+        g_child_pid.store(process.id, .seq_cst);
         self.process = process;
-
-        // Create thread to handle stdout
-        self.stdout_thread = try std.Thread.spawn(
-            .{},
-            outputHandler,
-            .{ self, process.stdout.?.reader() },
-        );
-
-        // Create thread to handle stderr
-        self.stderr_thread = try std.Thread.spawn(
-            .{},
-            errorHandler,
-            .{ self, process.stderr.?.reader() },
-        );
+        self.process_running = true;
     }
 
-    fn handleProcessState(self: *Self) !bool {
-        if (self.process) |*process| {
-            const pid = process.id;
-            const result = safeWaitpid(pid, 1) catch |err| {
-                switch (err) {
-                    error.ProcessNotFound => {
-                        // Process no longer exists
-                        std.log.info("Process not found", .{});
-                        self.process = null;
-                        self.process_state.store(.exited, .seq_cst);
-                        return true; // Continue watching for file changes
-                    },
-                    error.InvalidArgument => {
-                        std.log.err("Invalid argument to waitpid", .{});
-                        self.process = null;
-                        self.process_state.store(.erroring, .seq_cst);
-                        return true; // Continue watching
-                    },
-                    else => {
-                        std.log.err("Unexpected error in waitpid: {s}", .{@errorName(err)});
-                        self.process = null;
-                        self.process_state.store(.erroring, .seq_cst);
-                        return true; // Continue watching
-                    },
-                }
-            };
+    fn checkProcess(self: *Self) !void {
+        if (!self.process_running) return;
 
-            if (result.pid != 0) {
-                // Process has exited
-                if (std.posix.W.IFEXITED(result.status)) {
-                    const exit_code = std.posix.W.EXITSTATUS(result.status);
-                    if (exit_code != 0) {
-                        self.process_state.store(.erroring, .seq_cst);
-                        std.log.err("{s} exited with error code: {d}", .{ self.command[0], exit_code });
-                        return self.process_state.load(.seq_cst).handleProcessBehavior();
-                    } else {
-                        self.process_state.store(.exited, .seq_cst);
-                        // Switch back to main screen before exiting
-                        try std.io.getStdOut().writer().writeAll("\x1b[?1049l");
-                        std.log.info("{s} completed successfully", .{self.command[0]});
-                        return false; // Signal to exit the watch loop
-                    }
-                } else if (std.posix.W.IFSIGNALED(result.status)) {
-                    // Process was terminated by a signal
-                    self.process_state.store(.erroring, .seq_cst);
-                    const signal = std.posix.W.TERMSIG(result.status);
-                    std.log.err("{s} terminated by signal: {d}", .{ self.command[0], signal });
-                    return self.process_state.load(.seq_cst).handleProcessBehavior();
-                }
-
-                self.process_state.store(.erroring, .seq_cst);
-
-                // Clear the process reference since it's no longer running
-                self.process = null;
-            } else {
-                // Process is still running
-                self.process_state.store(.running, .seq_cst);
+        const process = self.process orelse return;
+        const result = safeWaitpid(process.id, 1) catch |err| {
+            switch (err) {
+                error.ProcessNotFound => {
+                    self.process = null;
+                    self.process_running = false;
+                    g_child_pid.store(0, .seq_cst);
+                },
+                else => {
+                    std.log.err("waitpid error: {s}", .{@errorName(err)});
+                    self.process = null;
+                    self.process_running = false;
+                    g_child_pid.store(0, .seq_cst);
+                },
             }
-        } else {
-            self.process_state.store(.exited, .seq_cst);
-        }
+            return;
+        };
 
-        return true; // Continue watching
+        if (result.pid == 0) return; // still running
+
+        // Process exited
+        self.process = null;
+        self.process_running = false;
+        g_child_pid.store(0, .seq_cst);
+
+        if (std.posix.W.IFEXITED(result.status)) {
+            const code = std.posix.W.EXITSTATUS(result.status);
+            if (code != 0) {
+                std.log.err("{s} exited with code {d}", .{ self.command[0], code });
+            } else {
+                std.log.info("{s} exited successfully", .{self.command[0]});
+            }
+        } else if (std.posix.W.IFSIGNALED(result.status)) {
+            const sig = std.posix.W.TERMSIG(result.status);
+            // Ignore SIGTERM/SIGKILL — these are expected when wx restarts the process
+            if (sig != std.posix.SIG.TERM and sig != std.posix.SIG.KILL) {
+                std.log.err("{s} terminated by signal {d}", .{ self.command[0], sig });
+            }
+        }
     }
 
     pub fn watch(self: *Self) !void {
-        // Initial scan
+        setupSignals();
+
+        // Initial scan (no changes counted)
         _ = try self.scanFiles(".");
 
         // Start the process initially
         self.startProcess() catch |err| {
-            self.process_state.store(.erroring, .seq_cst);
-            std.log.err("Failed to start process: {s}, error: {s}", .{ self.command[0], @errorName(err) });
+            std.log.err("Failed to start {s}: {s}", .{ self.command[0], @errorName(err) });
         };
 
-        while (true) {
-            std.debug.print("watch {s}\n", .{@tagName(self.process_state.load(.seq_cst))});
-            // Handle the current process state and decide whether to continue
-            const should_continue = try self.handleProcessState();
-            if (!should_continue) {
-                break;
-            }
+        var pending_restart = false;
 
-            std.time.sleep(500 * std.time.ns_per_ms); // 500ms poll interval
+        while (true) {
+            if (g_shutdown.load(.seq_cst)) break;
+
+            try self.checkProcess();
+
+            std.time.sleep(150 * std.time.ns_per_ms);
+
+            if (g_shutdown.load(.seq_cst)) break;
 
             const changes_detected = try self.scanFiles(".");
+            if (changes_detected) pending_restart = true;
 
-            if (changes_detected) {
-                std.log.info("File changes detected or process not running, restarting process...", .{});
+            // Only restart when the process is not running. This prevents the flicker
+            // loop caused by build tools (cargo, zig, etc.) writing artifacts while
+            // compiling — those file changes are noticed but held until the build exits.
+            if (pending_restart and !self.process_running) {
+                pending_restart = false;
+                std.log.info("Changes detected, restarting...", .{});
                 self.startProcess() catch |err| {
-                    self.process_state.store(.erroring, .seq_cst);
-                    std.log.err("Failed to restart process: {s}, error: {s}", .{ self.command[0], @errorName(err) });
+                    std.log.err("Failed to restart {s}: {s}", .{ self.command[0], @errorName(err) });
                 };
             }
+        }
+
+        // Shutdown: kill child and restore terminal
+        if (self.process) |*process| {
+            _ = process.kill() catch {};
+            _ = process.wait() catch {};
+            self.process = null;
+            g_child_pid.store(0, .seq_cst);
         }
     }
 };
