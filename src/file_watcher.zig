@@ -67,7 +67,6 @@ pub const FileWatcher = struct {
     command: []const []const u8,
     process: ?std.process.Child,
     process_running: bool,
-    gitignore: std.ArrayList([]const u8),
 
     pub fn init(allocator: std.mem.Allocator, command: []const []const u8) !Self {
         return Self{
@@ -76,7 +75,6 @@ pub const FileWatcher = struct {
             .command = command,
             .process = null,
             .process_running = false,
-            .gitignore = readGitIgnore(allocator) catch std.ArrayList([]const u8).init(allocator),
         };
     }
 
@@ -87,8 +85,6 @@ pub const FileWatcher = struct {
             g_child_pid.store(0, .seq_cst);
         }
 
-        self.gitignore.deinit();
-
         var iterator = self.files.iterator();
         while (iterator.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -98,59 +94,99 @@ pub const FileWatcher = struct {
         leaveAlternateScreen();
     }
 
-    fn readGitIgnore(allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
-        const file_contents = try std.fs.cwd().readFileAlloc(allocator, ".gitignore", 65536);
-        defer allocator.free(file_contents);
+    /// Load patterns from a .gitignore file in dir_path. Returns an empty list if none exists.
+    fn loadGitIgnore(allocator: std.mem.Allocator, dir_path: []const u8) std.ArrayList([]const u8) {
+        var patterns = std.ArrayList([]const u8).init(allocator);
+        const gitignore_path = std.fs.path.join(allocator, &.{ dir_path, ".gitignore" }) catch return patterns;
+        defer allocator.free(gitignore_path);
 
-        var gitignore = std.ArrayList([]const u8).init(allocator);
+        const contents = std.fs.cwd().readFileAlloc(allocator, gitignore_path, 65536) catch return patterns;
+        defer allocator.free(contents);
 
-        var lines = std.mem.splitSequence(u8, file_contents, "\n");
+        var lines = std.mem.splitSequence(u8, contents, "\n");
         while (lines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0 or trimmed[0] == '#') continue;
-            try gitignore.append(try allocator.dupe(u8, trimmed));
+            // Skip negation patterns (! prefix) — not supported
+            if (trimmed[0] == '!') continue;
+            patterns.append(allocator.dupe(u8, trimmed) catch continue) catch {};
         }
 
-        return gitignore;
+        return patterns;
     }
 
-    fn matchesPattern(pattern: []const u8, name: []const u8, full_path: []const u8) bool {
-        // Directory pattern: "node_modules/" matches directory by name
-        if (std.mem.endsWith(u8, pattern, "/")) {
-            return std.mem.eql(u8, name, pattern[0 .. pattern.len - 1]);
+    fn matchesPattern(pattern: []const u8, name: []const u8, rel_path: []const u8) bool {
+        // Directory-only pattern: "target/" — match the name without the trailing slash
+        const p = if (std.mem.endsWith(u8, pattern, "/")) pattern[0 .. pattern.len - 1] else pattern;
+
+        // Pattern with slash (other than trailing): anchored to the gitignore's dir.
+        // e.g. "src/gen" only matches "src/gen", not "pkg/src/gen".
+        if (std.mem.indexOfScalar(u8, p, '/') != null) {
+            // Strip leading slash if present
+            const anchored = if (p[0] == '/') p[1..] else p;
+            return std.mem.eql(u8, rel_path, anchored) or
+                std.mem.startsWith(u8, rel_path, anchored) and rel_path.len > anchored.len and rel_path[anchored.len] == '/';
         }
-        // Wildcard extension: "*.o" or "*.zig-cache"
-        if (std.mem.startsWith(u8, pattern, "*.")) {
-            return std.mem.endsWith(u8, name, pattern[1..]);
+
+        // No slash: match against the entry name only (any depth).
+        // Wildcard: "*.o", "*.zig-cache"
+        if (std.mem.startsWith(u8, p, "*.")) {
+            return std.mem.endsWith(u8, name, p[1..]);
         }
-        // Exact name match or full path match
-        return std.mem.eql(u8, name, pattern) or std.mem.eql(u8, full_path, pattern);
+        // Plain glob with leading *: e.g. "*.log" already handled above; handle "*foo"
+        if (p[0] == '*') {
+            return std.mem.endsWith(u8, name, p[1..]);
+        }
+
+        // Exact name match
+        return std.mem.eql(u8, name, p);
     }
 
-    fn isIgnored(self: *Self, name: []const u8, full_path: []const u8) bool {
-        if (std.mem.eql(u8, name, ".git")) return true;
-        for (self.gitignore.items) |pattern| {
-            if (matchesPattern(pattern, name, full_path)) return true;
+    fn isIgnored(patterns: []const []const u8, name: []const u8, rel_path: []const u8) bool {
+        for (patterns) |pattern| {
+            if (matchesPattern(pattern, name, rel_path)) return true;
         }
         return false;
     }
 
     fn scanFiles(self: *Self, dir_path: []const u8) !bool {
+        return self.scanDir(dir_path, ".");
+    }
+
+    fn scanDir(self: *Self, dir_path: []const u8, rel_base: []const u8) !bool {
         var changes_detected = false;
 
         var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
         defer dir.close();
 
+        // Load .gitignore for this directory
+        const local_patterns = loadGitIgnore(self.allocator, dir_path);
+        defer {
+            for (local_patterns.items) |p| self.allocator.free(p);
+            var lp = local_patterns;
+            lp.deinit();
+        }
+
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
+            // Always ignore .git
+            if (std.mem.eql(u8, entry.name, ".git")) continue;
+
+            // rel_path: path relative to this directory's .gitignore
+            const rel_path = if (std.mem.eql(u8, rel_base, "."))
+                try self.allocator.dupe(u8, entry.name)
+            else
+                try std.fs.path.join(self.allocator, &.{ rel_base, entry.name });
+            defer self.allocator.free(rel_path);
+
+            if (isIgnored(local_patterns.items, entry.name, rel_path)) continue;
+
             const full_path = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
             defer self.allocator.free(full_path);
 
-            if (self.isIgnored(entry.name, full_path)) continue;
-
             switch (entry.kind) {
                 .directory => {
-                    if (try self.scanFiles(full_path)) {
+                    if (try self.scanDir(full_path, rel_path)) {
                         changes_detected = true;
                     }
                 },
