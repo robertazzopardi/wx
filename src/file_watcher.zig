@@ -51,12 +51,8 @@ fn safeWaitpid(pid: std.posix.pid_t, flags: u32) !std.posix.WaitPidResult {
     }
 }
 
-fn enterAlternateScreen() void {
-    std.io.getStdOut().writer().writeAll("\x1b[?1049h\x1b[2J\x1b[H") catch {};
-}
-
-fn leaveAlternateScreen() void {
-    std.io.getStdOut().writer().writeAll("\x1b[?1049l") catch {};
+fn clearScreen() void {
+    std.io.getStdOut().writer().writeAll("\x1b[2J\x1b[H") catch {};
 }
 
 pub const FileWatcher = struct {
@@ -90,8 +86,6 @@ pub const FileWatcher = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.files.deinit();
-
-        leaveAlternateScreen();
     }
 
     /// Load patterns from a .gitignore file in dir_path. Returns an empty list if none exists.
@@ -223,7 +217,7 @@ pub const FileWatcher = struct {
             g_child_pid.store(0, .seq_cst);
         }
 
-        enterAlternateScreen();
+        clearScreen();
 
         var process = std.process.Child.init(self.command, self.allocator);
         // Inherit all stdio so TUI apps get a real TTY
