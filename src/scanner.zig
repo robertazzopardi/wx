@@ -56,10 +56,16 @@ fn isIgnored(patterns: []const []const u8, name: []const u8, rel_path: []const u
     return false;
 }
 
+/// Recursively scans `dir_path`, updating `files` with current mtimes.
+/// Returns `true` if any tracked file was added or changed since the last
+/// scan (the very first scan of a file never counts as a change).
 pub fn scanFiles(files: *FileMap, allocator: std.mem.Allocator, dir_path: []const u8) !bool {
     return scanDir(files, allocator, dir_path, ".");
 }
 
+/// Same as `scanFiles`, but for a subdirectory during recursion. `rel_base`
+/// is the path of `dir_path` relative to the scan root, used to anchor
+/// slash-containing `.gitignore` patterns.
 pub fn scanDir(files: *FileMap, allocator: std.mem.Allocator, dir_path: []const u8, rel_base: []const u8) !bool {
     var changes_detected = false;
 

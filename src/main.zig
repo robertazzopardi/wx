@@ -2,6 +2,14 @@ const std = @import("std");
 
 const FileWatcher = @import("file_watcher.zig").FileWatcher;
 
+const version = "0.1.0";
+
+fn printUsage(prog_name: []const u8) void {
+    std.log.info("Usage: {s} <command> [args...]\n", .{prog_name});
+    std.log.info("Example: {s} zig build run\n", .{prog_name});
+    std.log.info("Options:\n  -h, --help     Show this help message\n  -v, --version  Show version\n", .{});
+}
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
@@ -12,8 +20,17 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        std.log.info("Usage: {s} <command> [args...]\n", .{args[0]});
-        std.log.info("Example: {s} zig build run\n", .{args[0]});
+        printUsage(args[0]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "-h") or std.mem.eql(u8, args[1], "--help")) {
+        printUsage(args[0]);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "-v") or std.mem.eql(u8, args[1], "--version")) {
+        std.log.info("wx {s}\n", .{version});
         return;
     }
 
