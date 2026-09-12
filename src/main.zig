@@ -5,9 +5,9 @@ const FileWatcher = @import("file_watcher.zig").FileWatcher;
 const version = "0.1.0";
 
 fn printUsage(prog_name: []const u8) void {
-    std.log.info("Usage: {s} <command> [args...]\n", .{prog_name});
-    std.log.info("Example: {s} zig build run\n", .{prog_name});
-    std.log.info("Options:\n  -h, --help     Show this help message\n  -v, --version  Show version\n", .{});
+    std.debug.print("Usage: {s} <command> [args...]\n", .{prog_name});
+    std.debug.print("Example: {s} zig build run\n", .{prog_name});
+    std.debug.print("Options:\n  -h, --help     Show this help message\n  -v, --version  Show version\n", .{});
 }
 
 pub fn main() !void {
@@ -30,7 +30,7 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, args[1], "-v") or std.mem.eql(u8, args[1], "--version")) {
-        std.log.info("wx {s}\n", .{version});
+        std.debug.print("wx {s}\n", .{version});
         return;
     }
 
