@@ -18,7 +18,7 @@
 ### Building from source
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/robertazzopardi/wx.git
 cd wx
 zig build -Doptimize=ReleaseSafe
 ```
@@ -60,4 +60,4 @@ There are many out there, but none of the ones that I tried did exactly what I w
 
 ## Contributing
 
-Contributions are welcome! Feel free to open issues or submit pull requests.
+Contributions are welcome! Feel free to open issues or submit pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md).

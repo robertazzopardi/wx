@@ -2,6 +2,8 @@ const std = @import("std");
 const process = @import("process.zig");
 const scanner = @import("scanner.zig");
 
+/// Watches the current directory for file changes and restarts `command`
+/// whenever a non-ignored file is created, modified, or its mtime changes.
 pub const FileWatcher = struct {
     const Self = @This();
 
@@ -10,6 +12,8 @@ pub const FileWatcher = struct {
     command: []const []const u8,
     child: ?std.process.Child,
 
+    /// Creates a watcher that will run `command` on changes.
+    /// `command` must outlive the returned `FileWatcher`.
     pub fn init(allocator: std.mem.Allocator, command: []const []const u8) !Self {
         return Self{
             .allocator = allocator,
@@ -19,6 +23,7 @@ pub const FileWatcher = struct {
         };
     }
 
+    /// Stops the child process (if running) and frees tracked file state.
     pub fn deinit(self: *Self) void {
         if (self.child) |*child| {
             process.stopChild(child);
@@ -32,6 +37,8 @@ pub const FileWatcher = struct {
         self.files.deinit();
     }
 
+    /// Runs the watch loop: starts `command`, then restarts it whenever a
+    /// tracked file changes, until a shutdown signal (SIGINT/SIGTERM) arrives.
     pub fn watch(self: *Self) !void {
         process.setupSignals();
 

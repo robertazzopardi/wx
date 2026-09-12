@@ -59,6 +59,8 @@ fn safeWaitpid(pid: std.posix.pid_t, flags: u32) !std.posix.WaitPidResult {
 
 pub const CheckResult = enum { still_running, exited_ok, exited_error, exited_signal };
 
+/// Clears the screen and spawns `command` with stdio inherited from wx,
+/// tracking its pid for signal forwarding (e.g. SIGWINCH).
 pub fn startChild(command: []const []const u8, allocator: std.mem.Allocator) !std.process.Child {
     clearScreen();
     var child = std.process.Child.init(command, allocator);
@@ -70,12 +72,16 @@ pub fn startChild(command: []const []const u8, allocator: std.mem.Allocator) !st
     return child;
 }
 
+/// Kills and reaps `child`, clearing the tracked pid.
 pub fn stopChild(child: *std.process.Child) void {
     _ = child.kill() catch {};
     _ = child.wait() catch {};
     g_child_pid.store(0, .seq_cst);
 }
 
+/// Non-blocking check of whether `child` has exited, logging the outcome.
+/// SIGTERM/SIGKILL are treated as expected (wx's own restart/shutdown) and
+/// not logged as errors.
 pub fn checkChild(child: std.process.Child, cmd_name: []const u8) !CheckResult {
     const result = safeWaitpid(child.id, 1) catch |err| {
         switch (err) {

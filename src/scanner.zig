@@ -56,10 +56,16 @@ fn isIgnored(patterns: []const []const u8, name: []const u8, rel_path: []const u
     return false;
 }
 
+/// Recursively scans `dir_path`, updating `files` with current mtimes.
+/// Returns `true` if any tracked file was added or changed since the last
+/// scan (the very first scan of a file never counts as a change).
 pub fn scanFiles(files: *FileMap, allocator: std.mem.Allocator, dir_path: []const u8) !bool {
     return scanDir(files, allocator, dir_path, ".");
 }
 
+/// Same as `scanFiles`, but for a subdirectory during recursion. `rel_base`
+/// is the path of `dir_path` relative to the scan root, used to anchor
+/// slash-containing `.gitignore` patterns.
 pub fn scanDir(files: *FileMap, allocator: std.mem.Allocator, dir_path: []const u8, rel_base: []const u8) !bool {
     var changes_detected = false;
 
@@ -118,4 +124,31 @@ pub fn scanDir(files: *FileMap, allocator: std.mem.Allocator, dir_path: []const 
     }
 
     return changes_detected;
+}
+
+test "matchesPattern: extension wildcard" {
+    try std.testing.expect(matchesPattern("*.o", "main.o", "main.o"));
+    try std.testing.expect(!matchesPattern("*.o", "main.c", "main.c"));
+}
+
+test "matchesPattern: directory-only pattern" {
+    try std.testing.expect(matchesPattern("zig-out/", "zig-out", "zig-out"));
+}
+
+test "matchesPattern: exact name match" {
+    try std.testing.expect(matchesPattern(".DS_Store", ".DS_Store", ".DS_Store"));
+    try std.testing.expect(!matchesPattern(".DS_Store", "DS_Store", "DS_Store"));
+}
+
+test "matchesPattern: anchored path with slash" {
+    try std.testing.expect(matchesPattern("src/gen", "gen", "src/gen"));
+    try std.testing.expect(!matchesPattern("src/gen", "gen", "pkg/src/gen"));
+    try std.testing.expect(matchesPattern("src/gen", "gen", "src/gen/inner"));
+}
+
+test "isIgnored: matches any pattern in list" {
+    const patterns = [_][]const u8{ "*.o", ".DS_Store" };
+    try std.testing.expect(isIgnored(&patterns, "main.o", "main.o"));
+    try std.testing.expect(isIgnored(&patterns, ".DS_Store", ".DS_Store"));
+    try std.testing.expect(!isIgnored(&patterns, "main.zig", "main.zig"));
 }
